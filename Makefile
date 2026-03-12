@@ -35,12 +35,12 @@ LOCALARCH ?= $(shell uname -m | sed 's/x86_64/amd64/' | sed 's/aarch64/arm64/')
 ## Helm / Chart settings
 # Override HELM if your helm binary lives elsewhere (e.g. HELM=/usr/local/bin/helm).
 HELM ?= helm
+# CHART_VERSION strips the leading 'v' from VERSION for use in Chart.yaml (Helm requires semver without the prefix).
+CHART_VERSION ?= $(shell echo $(VERSION) | sed 's/^v//')
 HELM_CHART_DIR ?= ./charts/agentregistry
 HELM_PACKAGE_DIR ?= build/charts
 HELM_REGISTRY ?= ghcr.io
 HELM_REPO ?= agentregistry-dev/agentregistry
-# HELM_PUSH_MODE: oci (default, recommended) | repo (legacy chart repo / ChartMuseum)
-HELM_PUSH_MODE ?= oci
 HELM_PLUGIN_UNITTEST_URL ?= https://github.com/helm-unittest/helm-unittest
 # Pin the helm-unittest plugin version for reproducibility and allow install flags
 HELM_PLUGIN_UNITTEST_VERSION ?= v1.0.3
@@ -309,7 +309,7 @@ install-postgresql: ## Deploy standalone PostgreSQL/pgvector into the Kind clust
 BUILD ?= true
 
 .PHONY: install-agentregistry
-install-agentregistry: ## Build images and Helm install AgentRegistry into the Kind cluster (BUILD=false to skip image builds)
+install-agentregistry: charts-generate ## Build images and Helm install AgentRegistry into the Kind cluster (BUILD=false to skip image builds)
 ifeq ($(BUILD),true)
 install-agentregistry: docker-server docker-agentgateway
 endif
@@ -412,15 +412,23 @@ _helm-check:
 	  exit 1; \
 	fi
 
+# Generate Chart.yaml from Chart-template.yaml using envsubst.
+.PHONY: charts-generate
+charts-generate: ## Generate Chart.yaml from Chart-template.yaml (uses CHART_VERSION, default derived from git tags)
+	@echo "Generating $(HELM_CHART_DIR)/Chart.yaml (version=$(CHART_VERSION))..."
+	CHART_VERSION=$(CHART_VERSION) envsubst '$$CHART_VERSION' \
+	  < $(HELM_CHART_DIR)/Chart-template.yaml \
+	  > $(HELM_CHART_DIR)/Chart.yaml
+
 # Build chart dependencies (resolves Chart.yaml dependencies → charts/ subdir).
 .PHONY: charts-deps
-charts-deps: _helm-check ## Build Helm chart dependencies
+charts-deps: charts-generate _helm-check ## Build Helm chart dependencies
 	@echo "Building Helm chart dependencies for $(HELM_CHART_DIR)..."
 	$(HELM) dependency build $(HELM_CHART_DIR)
 
 # Lint chart with --strict so warnings are treated as errors.
 .PHONY: charts-lint
-charts-lint: charts-deps ## Lint the Helm chart with --strict
+charts-lint: charts-generate charts-deps ## Lint the Helm chart with --strict
 	@echo "Linting Helm chart $(HELM_CHART_DIR)..."
 	$(HELM) lint $(HELM_CHART_DIR) --strict
 
@@ -437,39 +445,32 @@ charts-render-test: charts-deps ## Render chart templates as a smoke test
 
 # Package the chart into $(HELM_PACKAGE_DIR)/.
 .PHONY: charts-package
-charts-package: charts-lint ## Package the Helm chart into $(HELM_PACKAGE_DIR)
+charts-package: charts-generate charts-lint ## Package the Helm chart into $(HELM_PACKAGE_DIR)
 	@mkdir -p $(HELM_PACKAGE_DIR)
 	@echo "Packaging chart $(HELM_CHART_DIR) → $(HELM_PACKAGE_DIR)/"
 	$(HELM) package $(HELM_CHART_DIR) -d $(HELM_PACKAGE_DIR)
 	@echo "Packaged chart(s):"
 	@ls -1 $(HELM_PACKAGE_DIR)/*.tgz
 
-# Push packaged chart(s) to an OCI registry.
-# Credentials are read from the environment at runtime (never stored in the Makefile):
-#   HELM_REGISTRY_USERNAME   – registry username (default: your shell $USER)
-#   HELM_REGISTRY_PASSWORD   – registry password / token (required)
+# Package the chart and push to an OCI registry. Caller must be logged in.
 # Override registry/repo: make charts-push HELM_REGISTRY=ghcr.io HELM_REPO=org/repo
 .PHONY: charts-push
-charts-push: charts-package ## Push packaged charts to the configured registry
-	@echo "Pushing chart(s) to $(HELM_REGISTRY)/$(HELM_REPO)/charts (mode: $(HELM_PUSH_MODE))"
-ifeq ($(HELM_PUSH_MODE),oci)
-	@if [ -z "$$HELM_REGISTRY_PASSWORD" ]; then \
-	  echo "ERROR: HELM_REGISTRY_PASSWORD is not set. Export it before running this target."; \
-	  exit 1; \
-	fi
-	@printf "%s" "$$HELM_REGISTRY_PASSWORD" | $(HELM) registry login $(HELM_REGISTRY) \
-	  --username "$${HELM_REGISTRY_USERNAME:-$$USER}" \
-	  --password-stdin
-	@for pkg in $(HELM_PACKAGE_DIR)/*.tgz; do \
-	  [ -f "$$pkg" ] || continue; \
-	  echo "  Pushing $$pkg → oci://$(HELM_REGISTRY)/$(HELM_REPO)/charts"; \
-	  $(HELM) push "$$pkg" "oci://$(HELM_REGISTRY)/$(HELM_REPO)/charts"; \
-	done
-	@$(HELM) registry logout $(HELM_REGISTRY) || true
-else
-	@echo "Non-OCI push (mode=$(HELM_PUSH_MODE)) — implement repo-specific push logic or use chart-releaser."
-	@exit 1
-endif
+charts-push: charts-package _helm-check ## Package and push chart to the configured OCI registry
+	@echo "Pushing $(HELM_PACKAGE_DIR)/agentregistry-$(CHART_VERSION).tgz → oci://$(HELM_REGISTRY)/$(HELM_REPO)/charts"
+	$(HELM) push "$(HELM_PACKAGE_DIR)/agentregistry-$(CHART_VERSION).tgz" "oci://$(HELM_REGISTRY)/$(HELM_REPO)/charts"
+
+# Generate SHA-256 checksums for all packaged chart files.
+.PHONY: charts-checksum
+charts-checksum: ## Generate SHA-256 checksum for the packaged chart in $(HELM_PACKAGE_DIR)
+	sha256sum "$(HELM_PACKAGE_DIR)/agentregistry-$(CHART_VERSION).tgz" > "$(HELM_PACKAGE_DIR)/checksums.txt"
+	@echo "--- checksum ---"
+	@cat $(HELM_PACKAGE_DIR)/checksums.txt
+
+# Full Helm release pipeline: test → push (→ lint → package → generate + deps) → checksum.
+# Required env vars for the push step: HELM_REGISTRY_PASSWORD (and optionally HELM_REGISTRY_USERNAME).
+# Override version: make charts-release CHART_VERSION=1.2.3
+.PHONY: charts-release
+charts-release: charts-test charts-push charts-checksum ## Full Helm release: lint, test, package, checksum, and push
 
 # Run helm-unittest against charts/agentregistry/tests/*.
 # This target:
@@ -477,7 +478,7 @@ endif
 #   2. checks for the helm-unittest plugin and installs it if missing
 #   3. runs the full test suite
 .PHONY: charts-test
-charts-test: _helm-check charts-deps helm-unittest-install ## Run helm-unittest chart tests
+charts-test: charts-generate _helm-check charts-deps helm-unittest-install ## Run helm-unittest chart tests
 	@echo "Running helm-unittest on $(HELM_CHART_DIR)..."
 	$(HELM) unittest $(HELM_CHART_DIR) --file "tests/*_test.yaml"
 
@@ -500,7 +501,3 @@ helm-unittest-install: _helm-check ## Install the helm-unittest plugin if needed
 	  echo "helm-unittest plugin already installed"; \
 	fi
 
-# Convenience: package → push → test.
-.PHONY: charts-all
-charts-all: charts-push charts-test ## Package, push, and test the Helm chart
-	@echo "charts-all complete: packaged, pushed, and tested."
